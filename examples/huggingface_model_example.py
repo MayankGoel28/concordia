@@ -52,12 +52,12 @@ def main():
     print(f"Response: {response}")
     print()
 
-    # Test choice selection
-    print("Testing choice selection:")
+    # Test choice selection using log probabilities
+    print("Testing choice selection using log probabilities:")
     prompt = "What is the best programming language for beginners?"
     choices = ["Python", "JavaScript", "Java", "C++"]
 
-    choice_idx, chosen_option, debug_info = model.sample_choice(
+    choice_idx, chosen_option, log_probs = model.sample_choice(
         prompt=prompt,
         responses=choices
     )
@@ -65,7 +65,28 @@ def main():
     print(f"Prompt: {prompt}")
     print(f"Choices: {choices}")
     print(f"Selected: {chosen_option} (index: {choice_idx})")
-    print(f"Debug info: {debug_info}")
+    print("Log probabilities for each choice:")
+    for choice, log_prob in log_probs.items():
+      print(f"  {choice}: {log_prob:.4f}")
+    print()
+
+    # Test another choice selection example
+    print("Testing choice selection with Yes/No question:")
+    prompt = "Is the sky blue?"
+    yes_no_choices = ["Yes", "No"]
+
+    choice_idx, chosen_option, log_probs = model.sample_choice(
+        prompt=prompt,
+        responses=yes_no_choices
+    )
+
+    print(f"Prompt: {prompt}")
+    print(f"Choices: {yes_no_choices}")
+    print(f"Selected: {chosen_option} (index: {choice_idx})")
+    print("Log probabilities for each choice:")
+    for choice, log_prob in log_probs.items():
+      print(f"  {choice}: {log_prob:.4f}")
+    print()
 
   except ImportError as e:
     print(f"Error: {e}")

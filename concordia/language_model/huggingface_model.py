@@ -15,7 +15,6 @@
 """Hugging Face Language Model, a wrapper for instruct models from Hugging Face."""
 
 from collections.abc import Collection, Sequence
-import json
 from typing import Any
 
 from concordia.language_model import language_model
@@ -223,6 +222,47 @@ class HuggingFaceLanguageModel(language_model.LanguageModel):
 
     return result
 
+  def _get_response_log_probability(self, prompt: str, response: str) -> float:
+    """Calculate the log probability of a response given a prompt.
+
+    Args:
+      prompt: The input prompt
+      response: The response choice to evaluate
+
+    Returns:
+      The sum of log probabilities for tokens in the response
+    """
+    import torch  # pylint: disable=import-outside-toplevel
+
+    formatted_prompt = self._format_prompt(prompt)
+    full_text = formatted_prompt + response
+
+    # Tokenize the full text (prompt + response)
+    full_tokens = self._tokenizer.encode(full_text, return_tensors="pt").to(self._device)
+    prompt_tokens = self._tokenizer.encode(formatted_prompt, return_tensors="pt").to(self._device)
+
+    # Get the response tokens (tokens that are only in the response)
+    response_start_idx = prompt_tokens.shape[1]
+
+    with torch.no_grad():
+      # Get logits for the full sequence
+      outputs = self._model(full_tokens)
+      logits = outputs.logits
+
+      # Convert logits to log probabilities
+      log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+      # Calculate log probability for each response token
+      response_log_prob = 0.0
+      for i in range(response_start_idx, full_tokens.shape[1]):
+        token_id = full_tokens[0, i].item()
+        # Use logits from the previous position to predict current token
+        if i > 0:
+          token_log_prob = log_probs[0, i-1, token_id].item()
+          response_log_prob += token_log_prob
+
+    return response_log_prob
+
   @override
   def sample_choice(
       self,
@@ -236,93 +276,35 @@ class HuggingFaceLanguageModel(language_model.LanguageModel):
     if seed is not None:
       torch.manual_seed(seed)
 
-    template = {'choice': '', 'single sentence explanation': ''}
-    sample = ''
-    answer = ''
-
-    for attempts in range(_MAX_MULTIPLE_CHOICE_ATTEMPTS):
-      # Increase temperature after the first failed attempt
-      temperature = sampling.dynamically_adjust_temperature(
-          attempts, _MAX_MULTIPLE_CHOICE_ATTEMPTS)
-
-      choice_prompt = (
-          f'{prompt}\n\n'
-          f'Choose one of the following options: {", ".join(responses)}\n'
-          f'Respond in the following JSON format: {json.dumps(template)}'
-      )
-
-      formatted_prompt = self._format_prompt(choice_prompt)
-
-      # Tokenize input
-      inputs = self._tokenizer.encode(formatted_prompt, return_tensors="pt").to(self._device)
-      input_length = inputs.shape[1]
-
-      # Generate response
-      with torch.no_grad():
-        outputs = self._model.generate(
-            inputs,
-            max_new_tokens=200,  # Shorter for choice responses
-            temperature=temperature,
-            do_sample=temperature > 0,
-            pad_token_id=self._tokenizer.eos_token_id,
-            eos_token_id=self._tokenizer.eos_token_id,
-            repetition_penalty=1.1,
-        )
-
-      # Decode only the generated part
-      generated_tokens = outputs[0][input_length:]
-      response_text = self._tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-
+    # Calculate log probabilities for each response
+    log_probs = {}
+    for response in responses:
       try:
-        # Try to parse as JSON
-        json_data_response = json.loads(response_text)
-      except json.JSONDecodeError:
-        # If JSON parsing fails, try to extract choice directly
-        for response in responses:
-          if response.lower() in response_text.lower():
-            answer = response
-            break
-        if answer:
-          try:
-            idx = responses.index(answer)
-            if self._measurements is not None:
-              self._measurements.publish_datum(
-                  self._channel, {'choices_calls': attempts}
-              )
-            debug = {'raw_response': response_text}
-            return idx, responses[idx], debug
-          except ValueError:
-            continue
-        continue
-
-      # Extract choice from JSON response
-      sample_or_none = json_data_response.get('choice', None)
-      if sample_or_none is None:
-        if isinstance(json_data_response, dict) and json_data_response:
-          sample = next(iter(json_data_response.values()))
-        elif isinstance(json_data_response, str) and json_data_response:
-          sample = json_data_response.strip()
-        else:
-          continue
-      else:
-        sample = sample_or_none
-        if isinstance(sample, str) and sample:
-          sample = sample.strip()
-
-      answer = sampling.extract_choice_response(sample)
-      try:
-        idx = responses.index(answer)
-      except ValueError:
-        continue
-      else:
+        log_prob = self._get_response_log_probability(prompt, response)
+        log_probs[response] = log_prob
+      except Exception as e:
+        # If we can't calculate log probability for a response, assign very low probability
+        log_probs[response] = float('-inf')
         if self._measurements is not None:
           self._measurements.publish_datum(
-              self._channel, {'choices_calls': attempts}
+              self._channel, {'log_prob_calculation_error': str(e)}
           )
-        debug = {'raw_response': response_text}
-        return idx, responses[idx], debug
 
-    raise language_model.InvalidResponseError(
-        (f'Too many multiple choice attempts.\nLast attempt: {sample}, ' +
-         f'extracted: {answer}')
-    )
+    # Find the response with the highest log probability
+    if not log_probs or all(prob == float('-inf') for prob in log_probs.values()):
+      raise language_model.InvalidResponseError(
+          "Could not calculate log probabilities for any response choices"
+      )
+
+    best_response = max(log_probs.keys(), key=lambda r: log_probs[r])
+    best_idx = responses.index(best_response)
+
+    if self._measurements is not None:
+      self._measurements.publish_datum(
+          self._channel, {
+              'choice_selection_method': 'log_probability',
+              'log_probs': log_probs
+          }
+      )
+
+    return best_idx, best_response, log_probs
